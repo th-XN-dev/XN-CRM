@@ -1,0 +1,1695 @@
+// XN CRM — core (Phase 1) schema.
+//
+// Tenancy model (an Organization is a "Center" in the management hierarchy):
+//   Platform OWNER (User.platformRole) ── manages every Center
+//   User ─┬─ OrganizationMembership ── Organization ─┬─ SubCenter ── Branch
+//         │                                          └─ Branch (directly under the center)
+//         │        │  └─ Role ── RolePermission ── Permission
+//         │        └─ BranchMembership ── Branch
+//         └─ RefreshToken
+//
+// Conventions
+// - UUID v7 primary keys (time-ordered → better index locality than v4).
+// - snake_case tables/columns in Postgres, camelCase in TypeScript.
+// - Tenant-owned rows always carry `organizationId`; future CRM tables must too.
+// - Organizations, branches and users are soft-deleted (`deletedAt`), never hard-deleted.
+// - Data-owning relations use `Restrict`; pure join tables use `Cascade`.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─── Identity ────────────────────────────────────────────────────────────────
+
+enum PlatformRole {
+  OWNER
+}
+
+model User {
+  id                 String        @id @default(uuid(7)) @db.Uuid
+  name               String        @db.VarChar(120)
+  /// Stored lower-cased. Either email or phone (or both) must be present.
+  email              String?       @unique @db.VarChar(254)
+  /// Stored in E.164 format, e.g. +998901234567.
+  phone              String?       @unique @db.VarChar(20)
+  passwordHash       String        @map("password_hash")
+  isActive           Boolean       @default(true) @map("is_active")
+  /// Platform-level role (XN CRM founder/operator). Null for center users.
+  platformRole       PlatformRole? @map("platform_role")
+  /// Set for accounts created with a temporary password (directors, staff).
+  mustChangePassword Boolean       @default(false) @map("must_change_password")
+  passwordChangedAt  DateTime?     @map("password_changed_at") @db.Timestamptz(3)
+  lastLoginAt        DateTime?     @map("last_login_at") @db.Timestamptz(3)
+  createdAt          DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt          DateTime?     @map("deleted_at") @db.Timestamptz(3)
+
+  ownedOrganizations      Organization[]
+  memberships             OrganizationMembership[]
+  refreshTokens           RefreshToken[]
+  teacherProfiles         Teacher[]
+  markedAttendance        Attendance[]
+  createdInvoices         Invoice[]                @relation("InvoiceCreatedBy")
+  cancelledInvoices       Invoice[]                @relation("InvoiceCancelledBy")
+  receivedPayments        Payment[]
+  issuedRefunds           Refund[]
+  cashSessions            CashSession[]
+  createdExpenses         Expense[]
+  assignedLeads           Lead[]                   @relation("LeadAssignee")
+  leadActivities          LeadActivity[]
+  employeeProfiles        Employee[]
+  createdTasks            Task[]                   @relation("TaskCreatedBy")
+  taskActivities          TaskActivity[]
+  taskComments            TaskComment[]
+  notifications           Notification[]
+  notificationPreferences NotificationPreference[]
+  telegramAccount         UserTelegramAccount?
+  telegramLinkTokens      TelegramLinkToken[]
+  createdChecklists       ChecklistTemplate[]      @relation("ChecklistCreatedBy")
+  dashboardLayouts        DashboardLayout[]
+
+  @@map("users")
+}
+
+model RefreshToken {
+  id           String    @id @default(uuid(7)) @db.Uuid
+  userId       String    @map("user_id") @db.Uuid
+  /// SHA-256 of the issued token. The raw token is never stored.
+  tokenHash    String    @unique @map("token_hash") @db.Char(64)
+  /// All tokens produced by rotating one login share a family.
+  /// Re-use of a rotated token revokes the whole family.
+  familyId     String    @map("family_id") @db.Uuid
+  replacedById String?   @map("replaced_by_id") @db.Uuid
+  userAgent    String?   @map("user_agent") @db.VarChar(512)
+  ipAddress    String?   @map("ip_address") @db.VarChar(64)
+  expiresAt    DateTime  @map("expires_at") @db.Timestamptz(3)
+  revokedAt    DateTime? @map("revoked_at") @db.Timestamptz(3)
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ─── Tenancy ─────────────────────────────────────────────────────────────────
+
+model Organization {
+  id              String       @id @default(uuid(7)) @db.Uuid
+  name            String       @db.VarChar(160)
+  slug            String       @unique @db.VarChar(80)
+  logoUrl         String?      @map("logo_url") @db.VarChar(2048)
+  phone           String?      @db.VarChar(20)
+  email           String?      @db.VarChar(254)
+  address         String?      @db.VarChar(500)
+  /// IANA timezone name.
+  timezone        String       @default("Asia/Tashkent") @db.VarChar(64)
+  /// ISO 4217 currency code.
+  currency        String       @default("UZS") @db.Char(3)
+  /// Branding: small square icon shown in the browser tab.
+  faviconUrl      String?      @map("favicon_url") @db.VarChar(2048)
+  /// Branding: "#RRGGBB"; the UI derives its whole accent palette from it.
+  primaryColor    String       @default("#4F46E5") @map("primary_color") @db.Char(7)
+  /// Branding: optional second accent ("#RRGGBB").
+  secondaryColor  String?      @map("secondary_color") @db.Char(7)
+  /// Default UI language for new sessions: uz | ru | en.
+  language        String       @default("uz") @db.VarChar(5)
+  /// Lifecycle, managed by the platform owner. Only ACTIVE centers inside
+  /// their activation period can be used by their members.
+  status          CenterStatus @default(ACTIVE)
+  /// First and last day (inclusive, center timezone) of the activation period.
+  activeFrom      DateTime?    @map("active_from") @db.Date
+  activeUntil     DateTime?    @map("active_until") @db.Date
+  statusChangedAt DateTime?    @map("status_changed_at") @db.Timestamptz(3)
+  ownerId         String       @map("owner_id") @db.Uuid
+  createdAt       DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt       DateTime?    @map("deleted_at") @db.Timestamptz(3)
+
+  owner                   User                     @relation(fields: [ownerId], references: [id], onDelete: Restrict)
+  subCenters              SubCenter[]
+  branches                Branch[]
+  memberships             OrganizationMembership[]
+  roles                   Role[]
+  families                Family[]
+  students                Student[]
+  courses                 Course[]
+  groups                  Group[]
+  enrollments             Enrollment[]
+  teachers                Teacher[]
+  rooms                   Room[]
+  schedules               Schedule[]
+  attendance              Attendance[]
+  invoices                Invoice[]
+  payments                Payment[]
+  refunds                 Refund[]
+  cashSessions            CashSession[]
+  expenses                Expense[]
+  counters                DocumentCounter[]
+  leadSources             LeadSource[]
+  leadPipelines           LeadPipeline[]
+  leadStages              LeadStage[]
+  leads                   Lead[]
+  leadActivities          LeadActivity[]
+  positions               Position[]
+  departments             Department[]
+  employees               Employee[]
+  employeeBranches        EmployeeBranch[]
+  tasks                   Task[]
+  taskActivities          TaskActivity[]
+  taskComments            TaskComment[]
+  notifications           Notification[]
+  notificationDeliveries  NotificationDelivery[]
+  notificationPreferences NotificationPreference[]
+  notificationTemplates   NotificationTemplate[]
+  notificationPolicies    NotificationPolicy[]
+  checklistTemplates      ChecklistTemplate[]
+  checklistItems          ChecklistItem[]
+  dashboardLayouts        DashboardLayout[]
+
+  @@index([ownerId])
+  @@index([status])
+  @@map("organizations")
+}
+
+enum CenterStatus {
+  ACTIVE
+  FROZEN
+  ARCHIVED
+}
+
+/// A division of a center (e.g. "Jony Kids English") grouping branches.
+/// Branches may also sit directly under the center (subCenterId = null).
+model SubCenter {
+  id             String       @id @default(uuid(7)) @db.Uuid
+  organizationId String       @map("organization_id") @db.Uuid
+  name           String       @db.VarChar(160)
+  /// Short code, unique inside the center.
+  code           String       @db.VarChar(32)
+  /// URL-friendly id, unique inside the center.
+  slug           String       @db.VarChar(80)
+  logoUrl        String?      @map("logo_url") @db.VarChar(2048)
+  primaryColor   String?      @map("primary_color") @db.Char(7)
+  phone          String?      @db.VarChar(20)
+  address        String?      @db.VarChar(500)
+  status         CenterStatus @default(ACTIVE)
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branches     Branch[]
+
+  @@unique([organizationId, code])
+  @@unique([organizationId, slug])
+  @@unique([id, organizationId])
+  @@index([organizationId, status])
+  @@map("sub_centers")
+}
+
+model Branch {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  /// Optional parent division; null = directly under the center.
+  subCenterId    String?   @map("sub_center_id") @db.Uuid
+  name           String    @db.VarChar(160)
+  /// Short code, unique inside the organization (e.g. "TRM").
+  code           String    @db.VarChar(32)
+  phone          String?   @db.VarChar(20)
+  address        String?   @db.VarChar(500)
+  isActive       Boolean   @default(true) @map("is_active")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt      DateTime? @map("deleted_at") @db.Timestamptz(3)
+
+  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  subCenter      SubCenter?          @relation(fields: [subCenterId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  members        BranchMembership[]
+  families       Family[]
+  students       Student[]
+  groups         Group[]
+  teachers       Teacher[]
+  rooms          Room[]
+  invoices       Invoice[]
+  cashSessions   CashSession[]
+  expenses       Expense[]
+  leads          Lead[]
+  leadActivities LeadActivity[]
+  employees      Employee[]
+  employeeLinks  EmployeeBranch[]
+  tasks          Task[]
+  notifications  Notification[]
+  checklists     ChecklistTemplate[]
+
+  @@unique([organizationId, code])
+  // Target for composite FKs that guarantee child rows stay inside the same organization.
+  @@unique([id, organizationId])
+  @@index([organizationId, isActive])
+  @@index([subCenterId])
+  @@map("branches")
+}
+
+enum MembershipStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+}
+
+/// A user's membership in one organization. Carries the user's role in that
+/// organization (this is the "UserRole" link) and their branch access.
+model OrganizationMembership {
+  id                 String           @id @default(uuid(7)) @db.Uuid
+  userId             String           @map("user_id") @db.Uuid
+  organizationId     String           @map("organization_id") @db.Uuid
+  roleId             String           @map("role_id") @db.Uuid
+  status             MembershipStatus @default(ACTIVE)
+  /// true → access to every branch (current and future) of the organization.
+  allBranches        Boolean          @default(false) @map("all_branches")
+  /// Extra permissions granted to this member on top of the role (from a
+  /// short grantable list, e.g. checklists.manage). Never more than the granter has.
+  grantedPermissions String[]         @default([]) @map("granted_permissions")
+  createdAt          DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user         User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization       @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  role         Role               @relation(fields: [roleId], references: [id], onDelete: Restrict)
+  branches     BranchMembership[]
+
+  @@unique([userId, organizationId])
+  @@unique([id, organizationId])
+  @@index([organizationId])
+  @@index([roleId])
+  @@map("organization_memberships")
+}
+
+/// Grants a membership access to a specific branch. Both composite FKs share
+/// `organizationId`, so the database itself rejects cross-organization links.
+model BranchMembership {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  membershipId   String   @map("membership_id") @db.Uuid
+  branchId       String   @map("branch_id") @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  membership OrganizationMembership @relation(fields: [membershipId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  branch     Branch                 @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([membershipId, branchId])
+  @@index([branchId])
+  @@map("branch_memberships")
+}
+
+// ─── RBAC ────────────────────────────────────────────────────────────────────
+
+/// System roles have `organizationId = null` and are shared by every
+/// organization. Organization-specific custom roles can be added later
+/// by setting `organizationId`.
+model Role {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String?  @map("organization_id") @db.Uuid
+  /// Stable machine name, e.g. OWNER, ADMIN.
+  key            String   @db.VarChar(64)
+  name           String   @db.VarChar(120)
+  description    String?  @db.VarChar(500)
+  isSystem       Boolean  @default(false) @map("is_system")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization?            @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  permissions  RolePermission[]
+  memberships  OrganizationMembership[]
+
+  @@unique([organizationId, key])
+  @@index([key])
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  /// "<module>.<action>", e.g. branch.create
+  key         String   @unique @db.VarChar(100)
+  module      String   @db.VarChar(50)
+  description String?  @db.VarChar(500)
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  roles RolePermission[]
+
+  @@index([module])
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String   @map("role_id") @db.Uuid
+  permissionId String   @map("permission_id") @db.Uuid
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@index([permissionId])
+  @@map("role_permissions")
+}
+
+// ─── Academic core (Phase 2) ─────────────────────────────────────────────────
+//
+// Organization ─┬─ Family ── Student ── Enrollment ── Group ─┬─ Course ── Level
+//               └─ Branch ───────────────────────────────────┘
+//
+// Every tenant-owned relation is a composite FK that includes `organizationId`
+// (and `courseId` for levels), so the database itself rejects links across
+// organizations — even if a service-layer check were ever missed.
+
+enum Gender {
+  MALE
+  FEMALE
+}
+
+enum StudentStatus {
+  ACTIVE
+  FROZEN
+  GRADUATED
+  LEFT
+}
+
+enum GroupStatus {
+  ACTIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+/// A future WAITLISTED status slots in here without schema redesign
+/// (capacity only counts ACTIVE enrollments).
+enum EnrollmentStatus {
+  ACTIVE
+  COMPLETED
+  TRANSFERRED
+  CANCELLED
+}
+
+/// The paying customer unit: one family, many students.
+model Family {
+  id              String   @id @default(uuid(7)) @db.Uuid
+  organizationId  String   @map("organization_id") @db.Uuid
+  /// Optional home branch. Children may still study in other branches.
+  primaryBranchId String?  @map("primary_branch_id") @db.Uuid
+  name            String   @db.VarChar(160)
+  phone           String   @db.VarChar(20)
+  secondaryPhone  String?  @map("secondary_phone") @db.VarChar(20)
+  email           String?  @db.VarChar(254)
+  address         String?  @db.VarChar(500)
+  notes           String?  @db.Text
+  isActive        Boolean  @default(true) @map("is_active")
+  createdAt       DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization  Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  primaryBranch Branch?      @relation(fields: [primaryBranchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  students      Student[]
+  invoices      Invoice[]
+  payments      Payment[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, isActive])
+  @@index([organizationId, phone])
+  @@index([organizationId, primaryBranchId])
+  @@map("families")
+}
+
+model Student {
+  id             String        @id @default(uuid(7)) @db.Uuid
+  organizationId String        @map("organization_id") @db.Uuid
+  familyId       String        @map("family_id") @db.Uuid
+  /// Current home branch — drives branch-level access. Follows the student
+  /// when they are enrolled/transferred into a group of another branch.
+  branchId       String        @map("branch_id") @db.Uuid
+  firstName      String        @map("first_name") @db.VarChar(80)
+  lastName       String        @map("last_name") @db.VarChar(80)
+  middleName     String?       @map("middle_name") @db.VarChar(80)
+  birthDate      DateTime?     @map("birth_date") @db.Date
+  gender         Gender?
+  phone          String?       @db.VarChar(20)
+  status         StudentStatus @default(ACTIVE)
+  joinedAt       DateTime      @default(dbgenerated("CURRENT_DATE")) @map("joined_at") @db.Date
+  leftAt         DateTime?     @map("left_at") @db.Date
+  notes          String?       @db.Text
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  family       Family       @relation(fields: [familyId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  branch       Branch       @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  enrollments  Enrollment[]
+  invoices     Invoice[]
+  payments     Payment[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, status])
+  @@index([organizationId, branchId, status])
+  @@index([organizationId, lastName, firstName])
+  @@index([organizationId, joinedAt])
+  @@index([organizationId, leftAt])
+  @@index([familyId])
+  @@map("students")
+}
+
+/// A subject the center teaches. Organization-wide: any branch may run groups of it.
+model Course {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  name           String   @db.VarChar(160)
+  code           String   @db.VarChar(32)
+  description    String?  @db.Text
+  /// Default price; each group stores its own snapshot.
+  monthlyPrice   Decimal  @map("monthly_price") @db.Decimal(14, 2)
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  levels       Level[]
+  groups       Group[]
+
+  @@unique([organizationId, code])
+  @@unique([id, organizationId])
+  @@index([organizationId, isActive])
+  @@map("courses")
+}
+
+/// Tenant isolation is inherited from the parent course.
+model Level {
+  id          String   @id @default(uuid(7)) @db.Uuid
+  courseId    String   @map("course_id") @db.Uuid
+  name        String   @db.VarChar(160)
+  code        String   @db.VarChar(32)
+  description String?  @db.Text
+  order       Int      @default(0)
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  course Course  @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  groups Group[]
+
+  @@unique([courseId, code])
+  // Lets Group reference (levelId, courseId): a level of another course is rejected by the DB.
+  @@unique([id, courseId])
+  @@index([courseId, order])
+  @@map("levels")
+}
+
+model Group {
+  id             String      @id @default(uuid(7)) @db.Uuid
+  organizationId String      @map("organization_id") @db.Uuid
+  branchId       String      @map("branch_id") @db.Uuid
+  courseId       String      @map("course_id") @db.Uuid
+  levelId        String?     @map("level_id") @db.Uuid
+  name           String      @db.VarChar(160)
+  capacity       Int
+  /// Price snapshot at creation (defaults to the course price).
+  monthlyPrice   Decimal     @map("monthly_price") @db.Decimal(14, 2)
+  status         GroupStatus @default(ACTIVE)
+  startDate      DateTime    @map("start_date") @db.Date
+  endDate        DateTime?   @map("end_date") @db.Date
+  /// Primary teacher. Co-teachers can later go into a GroupTeacher join table.
+  teacherId      String?     @map("teacher_id") @db.Uuid
+  /// Primary room (default for new schedule slots). Always in the group's branch.
+  roomId         String?     @map("room_id") @db.Uuid
+  createdAt      DateTime    @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime    @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch       @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  course       Course       @relation(fields: [courseId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  level        Level?       @relation(fields: [levelId, courseId], references: [id, courseId], onDelete: Restrict)
+  teacher      Teacher?     @relation(fields: [teacherId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  room         Room?        @relation(fields: [roomId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+  enrollments  Enrollment[]
+  schedules    Schedule[]
+  attendance   Attendance[]
+
+  @@unique([id, organizationId])
+  // Lets Enrollment pin (groupId, organizationId, branchId) to the group's real branch.
+  @@unique([id, organizationId, branchId])
+  @@index([organizationId, branchId, status])
+  @@index([organizationId, courseId])
+  @@index([levelId])
+  @@index([teacherId])
+  @@index([roomId])
+  @@map("groups")
+}
+
+/// Student ↔ Group, with history. Rows are never deleted: transfers and
+/// cancellations close the row (`endedAt` + status) and, for transfers, open a new one.
+model Enrollment {
+  id                String           @id @default(uuid(7)) @db.Uuid
+  organizationId    String           @map("organization_id") @db.Uuid
+  /// Always equal to the group's branch (enforced by the composite FK).
+  branchId          String           @map("branch_id") @db.Uuid
+  studentId         String           @map("student_id") @db.Uuid
+  groupId           String           @map("group_id") @db.Uuid
+  startedAt         DateTime         @map("started_at") @db.Date
+  endedAt           DateTime?        @map("ended_at") @db.Date
+  status            EnrollmentStatus @default(ACTIVE)
+  notes             String?          @db.Text
+  /// Previous enrollment when this one was created by a transfer.
+  transferredFromId String?          @unique @map("transferred_from_id") @db.Uuid
+  createdAt         DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization    Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  student         Student      @relation(fields: [studentId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  group           Group        @relation(fields: [groupId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+  transferredFrom Enrollment?  @relation("EnrollmentTransfer", fields: [transferredFromId], references: [id], onDelete: NoAction)
+  transferredTo   Enrollment?  @relation("EnrollmentTransfer")
+  attendance      Attendance[]
+
+  // Lets Attendance pin (enrollment, group, organization, branch) together.
+  @@unique([id, groupId, organizationId, branchId])
+  @@index([organizationId, branchId, status])
+  @@index([organizationId, status])
+  @@index([studentId, status])
+  @@index([groupId, status])
+  @@map("enrollments")
+}
+
+// ─── Teaching (Phase 3) ──────────────────────────────────────────────────────
+//
+// Branch ─┬─ Teacher ─┐
+//         └─ Room ────┼─ Group ── Schedule (weekly slots)
+//                     └─ Enrollment ── Attendance (one per enrollment per date)
+
+enum TeacherStatus {
+  ACTIVE
+  INACTIVE
+}
+
+enum DayOfWeek {
+  MONDAY
+  TUESDAY
+  WEDNESDAY
+  THURSDAY
+  FRIDAY
+  SATURDAY
+  SUNDAY
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  EXCUSED
+}
+
+/// Minimal teaching profile. A future HR module adds an Employee model and
+/// links it here (e.g. `employeeId`) instead of replacing this table.
+model Teacher {
+  id             String        @id @default(uuid(7)) @db.Uuid
+  organizationId String        @map("organization_id") @db.Uuid
+  /// Home branch (drives branch-level access). May still teach in other branches.
+  branchId       String        @map("branch_id") @db.Uuid
+  /// Login account, when the teacher uses the CRM. Enables "own groups" access.
+  userId         String?       @map("user_id") @db.Uuid
+  firstName      String        @map("first_name") @db.VarChar(80)
+  lastName       String        @map("last_name") @db.VarChar(80)
+  phone          String?       @db.VarChar(20)
+  status         TeacherStatus @default(ACTIVE)
+  notes          String?       @db.Text
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch       @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  groups       Group[]
+
+  @@unique([id, organizationId])
+  /// One teacher profile per user per organization.
+  @@unique([organizationId, userId])
+  @@index([organizationId, branchId, status])
+  @@index([organizationId, lastName, firstName])
+  @@map("teachers")
+}
+
+model Room {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  branchId       String   @map("branch_id") @db.Uuid
+  name           String   @db.VarChar(120)
+  /// Unique within the branch. @example "101"
+  code           String   @db.VarChar(32)
+  capacity       Int
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch       @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  groups       Group[]
+  schedules    Schedule[]
+
+  @@unique([branchId, code])
+  // Target for composite FKs: a room is only usable inside its own branch.
+  @@unique([id, organizationId, branchId])
+  @@index([organizationId, branchId, isActive])
+  @@map("rooms")
+}
+
+/// A weekly recurring lesson slot of a group. Times are wall-clock times in
+/// the organization's timezone (Organization.timezone).
+model Schedule {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  /// Always the group's branch (composite FK).
+  branchId       String    @map("branch_id") @db.Uuid
+  groupId        String    @map("group_id") @db.Uuid
+  /// Snapshot of the group's room at creation unless given explicitly.
+  roomId         String?   @map("room_id") @db.Uuid
+  dayOfWeek      DayOfWeek @map("day_of_week")
+  startTime      DateTime  @map("start_time") @db.Time(0)
+  endTime        DateTime  @map("end_time") @db.Time(0)
+  isActive       Boolean   @default(true) @map("is_active")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  group        Group        @relation(fields: [groupId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+  room         Room?        @relation(fields: [roomId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+
+  @@index([organizationId, branchId, dayOfWeek])
+  @@index([groupId, isActive])
+  @@index([roomId, dayOfWeek, isActive])
+  @@map("schedules")
+}
+
+/// One mark per enrollment per calendar date.
+model Attendance {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  branchId       String           @map("branch_id") @db.Uuid
+  enrollmentId   String           @map("enrollment_id") @db.Uuid
+  groupId        String           @map("group_id") @db.Uuid
+  date           DateTime         @db.Date
+  status         AttendanceStatus
+  checkInAt      DateTime?        @map("check_in_at") @db.Timestamptz(3)
+  note           String?          @db.VarChar(1000)
+  markedById     String           @map("marked_by_id") @db.Uuid
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  // The enrollment FK carries group/org/branch, so a mark can never point at another group's enrollment.
+  enrollment   Enrollment   @relation(fields: [enrollmentId, groupId, organizationId, branchId], references: [id, groupId, organizationId, branchId], onDelete: Restrict)
+  group        Group        @relation(fields: [groupId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+  markedBy     User         @relation(fields: [markedById], references: [id], onDelete: Restrict)
+
+  @@unique([organizationId, enrollmentId, date])
+  @@index([organizationId, groupId, date])
+  @@index([organizationId, branchId, date])
+  @@index([groupId, status])
+  @@index([enrollmentId, status])
+  @@map("attendance")
+}
+
+// ─── Finance (Phase 4) ───────────────────────────────────────────────────────
+//
+// Family ── Invoice ── Payment ── Refund
+//                        │           │
+//                   CashSession ─────┴── Expense (CASH ones)
+//
+// Money is DECIMAL(14,2). Nothing here stores a "balance" or "debt": they are
+// always derived — debt = finalAmount − (Σ payments − Σ refunds).
+// Payments and refunds are append-only history.
+
+/// Stored lifecycle. OVERDUE is not stored: it is derived at read time
+/// (PENDING/PARTIAL with dueDate < today in the organization timezone).
+enum InvoiceStatus {
+  PENDING
+  PARTIAL
+  PAID
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  BANK_TRANSFER
+  ONLINE
+  OTHER
+}
+
+enum CashSessionStatus {
+  OPEN
+  CLOSED
+}
+
+enum ExpenseCategory {
+  RENT
+  SALARY
+  UTILITY
+  MARKETING
+  EQUIPMENT
+  OFFICE
+  TRANSPORT
+  OTHER
+}
+
+enum ExpensePaymentMethod {
+  CASH
+  CARD
+  BANK_TRANSFER
+  OTHER
+}
+
+/// Gap-free per-organization sequences (e.g. key "invoice:2026" → INV-2026-000042).
+model DocumentCounter {
+  organizationId String @map("organization_id") @db.Uuid
+  key            String @db.VarChar(64)
+  value          Int
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@id([organizationId, key])
+  @@map("document_counters")
+}
+
+model Invoice {
+  id             String        @id @default(uuid(7)) @db.Uuid
+  organizationId String        @map("organization_id") @db.Uuid
+  branchId       String        @map("branch_id") @db.Uuid
+  familyId       String        @map("family_id") @db.Uuid
+  /// Null for family-level charges (e.g. a registration fee).
+  studentId      String?       @map("student_id") @db.Uuid
+  /// Human-readable, unique per organization. @example "INV-2026-000042"
+  invoiceNumber  String        @map("invoice_number") @db.VarChar(32)
+  issueDate      DateTime      @map("issue_date") @db.Date
+  amount         Decimal       @db.Decimal(14, 2)
+  discount       Decimal       @default(0) @db.Decimal(14, 2)
+  /// amount − discount (CHECK constraint).
+  finalAmount    Decimal       @map("final_amount") @db.Decimal(14, 2)
+  dueDate        DateTime      @map("due_date") @db.Date
+  status         InvoiceStatus @default(PENDING)
+  description    String?       @db.VarChar(1000)
+  createdById    String        @map("created_by_id") @db.Uuid
+  cancelledAt    DateTime?     @map("cancelled_at") @db.Timestamptz(3)
+  cancelledById  String?       @map("cancelled_by_id") @db.Uuid
+  cancelReason   String?       @map("cancel_reason") @db.VarChar(500)
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch       @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  family       Family       @relation(fields: [familyId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  student      Student?     @relation(fields: [studentId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  createdBy    User         @relation("InvoiceCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  cancelledBy  User?        @relation("InvoiceCancelledBy", fields: [cancelledById], references: [id], onDelete: Restrict)
+  payments     Payment[]
+  refunds      Refund[]
+
+  @@unique([organizationId, invoiceNumber])
+  @@unique([id, organizationId])
+  // Lets Payment pin itself to the invoice's branch.
+  @@unique([id, organizationId, branchId])
+  @@index([organizationId, branchId, status])
+  @@index([organizationId, familyId])
+  @@index([organizationId, studentId])
+  @@index([organizationId, status, dueDate])
+  @@index([organizationId, issueDate])
+  @@map("invoices")
+}
+
+model Payment {
+  id             String        @id @default(uuid(7)) @db.Uuid
+  organizationId String        @map("organization_id") @db.Uuid
+  /// Always the invoice's branch (composite FK).
+  branchId       String        @map("branch_id") @db.Uuid
+  invoiceId      String        @map("invoice_id") @db.Uuid
+  familyId       String        @map("family_id") @db.Uuid
+  studentId      String?       @map("student_id") @db.Uuid
+  amount         Decimal       @db.Decimal(14, 2)
+  method         PaymentMethod
+  paymentDate    DateTime      @map("payment_date") @db.Date
+  /// User who received the payment.
+  cashierId      String        @map("cashier_id") @db.Uuid
+  /// Set for CASH payments: the cashier's open session in the same branch.
+  cashSessionId  String?       @map("cash_session_id") @db.Uuid
+  /// Client idempotency key, unique per organization.
+  transactionId  String        @map("transaction_id") @db.VarChar(100)
+  note           String?       @db.VarChar(1000)
+  createdAt      DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  invoice      Invoice      @relation(fields: [invoiceId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+  family       Family       @relation(fields: [familyId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  student      Student?     @relation(fields: [studentId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  cashier      User         @relation(fields: [cashierId], references: [id], onDelete: Restrict)
+  cashSession  CashSession? @relation(fields: [cashSessionId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+  refunds      Refund[]
+
+  @@unique([organizationId, transactionId])
+  @@unique([id, organizationId, branchId])
+  @@index([organizationId, branchId, paymentDate])
+  @@index([organizationId, paymentDate, method])
+  @@index([invoiceId])
+  @@index([organizationId, familyId])
+  @@index([organizationId, studentId])
+  @@index([cashierId])
+  @@index([cashSessionId])
+  @@map("payments")
+}
+
+/// Money returned for (part of) a payment. The payment itself stays untouched.
+model Refund {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  branchId       String   @map("branch_id") @db.Uuid
+  paymentId      String   @map("payment_id") @db.Uuid
+  /// Denormalized from the payment for fast balance aggregation.
+  invoiceId      String   @map("invoice_id") @db.Uuid
+  amount         Decimal  @db.Decimal(14, 2)
+  reason         String   @db.VarChar(1000)
+  refundedById   String   @map("refunded_by_id") @db.Uuid
+  refundedAt     DateTime @default(now()) @map("refunded_at") @db.Timestamptz(3)
+  /// Set when cash leaves the drawer (refund of a CASH payment).
+  cashSessionId  String?  @map("cash_session_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  payment      Payment      @relation(fields: [paymentId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+  invoice      Invoice      @relation(fields: [invoiceId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  refundedBy   User         @relation(fields: [refundedById], references: [id], onDelete: Restrict)
+  cashSession  CashSession? @relation(fields: [cashSessionId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+
+  @@index([paymentId])
+  @@index([invoiceId])
+  @@index([organizationId, branchId, refundedAt])
+  @@index([cashSessionId])
+  @@map("refunds")
+}
+
+/// A cashier's drawer shift. One OPEN session per cashier per organization
+/// (partial unique index in the migration).
+model CashSession {
+  id              String            @id @default(uuid(7)) @db.Uuid
+  organizationId  String            @map("organization_id") @db.Uuid
+  branchId        String            @map("branch_id") @db.Uuid
+  cashierId       String            @map("cashier_id") @db.Uuid
+  openedAt        DateTime          @default(now()) @map("opened_at") @db.Timestamptz(3)
+  closedAt        DateTime?         @map("closed_at") @db.Timestamptz(3)
+  openingBalance  Decimal           @map("opening_balance") @db.Decimal(14, 2)
+  /// opening + cash in − cash out, computed at close.
+  expectedBalance Decimal?          @map("expected_balance") @db.Decimal(14, 2)
+  /// Counted by the cashier at close.
+  closingBalance  Decimal?          @map("closing_balance") @db.Decimal(14, 2)
+  /// closingBalance − expectedBalance.
+  difference      Decimal?          @db.Decimal(14, 2)
+  status          CashSessionStatus @default(OPEN)
+  note            String?           @db.VarChar(1000)
+  createdAt       DateTime          @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime          @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch       @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  cashier      User         @relation(fields: [cashierId], references: [id], onDelete: Restrict)
+  payments     Payment[]
+  refunds      Refund[]
+  expenses     Expense[]
+
+  @@unique([id, organizationId, branchId])
+  @@index([organizationId, branchId, status])
+  @@index([organizationId, cashierId, status])
+  @@map("cash_sessions")
+}
+
+model Expense {
+  id             String               @id @default(uuid(7)) @db.Uuid
+  organizationId String               @map("organization_id") @db.Uuid
+  branchId       String               @map("branch_id") @db.Uuid
+  category       ExpenseCategory
+  amount         Decimal              @db.Decimal(14, 2)
+  paymentMethod  ExpensePaymentMethod @map("payment_method")
+  description    String?              @db.VarChar(1000)
+  expenseDate    DateTime             @map("expense_date") @db.Date
+  createdById    String               @map("created_by_id") @db.Uuid
+  /// CASH expenses paid from the creator's open drawer in this branch.
+  cashSessionId  String?              @map("cash_session_id") @db.Uuid
+  createdAt      DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch       @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  createdBy    User         @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  cashSession  CashSession? @relation(fields: [cashSessionId, organizationId, branchId], references: [id, organizationId, branchId], onDelete: Restrict)
+
+  @@index([organizationId, branchId, expenseDate])
+  @@index([organizationId, category])
+  @@index([cashSessionId])
+  @@map("expenses")
+}
+
+// ─── Leads & CRM Sales (Phase 5) ───────────────────────────────────────────────
+//
+// LeadSource ─┐
+// LeadPipeline ── LeadStage ─┐
+//                            ├─ Lead ── LeadActivity (append-only history)
+//                Branch ─────┘   │
+//                                └─ convert → Family + Student + Enrollment
+//
+// A Lead is the pre-enrollment funnel record. It is never the same entity as a
+// Student: conversion *creates* a Family/Student/Enrollment and stamps the lead
+// CONVERTED. Sources, pipelines and stages are per-organization configuration
+// (seeded with sensible defaults on organization creation), so the funnel is
+// never hardcoded. Every tenant-owned relation is a composite FK carrying
+// `organizationId`, matching the rest of the schema.
+
+enum LeadStatus {
+  NEW
+  CONTACTED
+  QUALIFIED
+  TRIAL_BOOKED
+  TRIAL_ATTENDED
+  NEGOTIATION
+  CONVERTED
+  LOST
+}
+
+enum LeadPriority {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum LeadActivityType {
+  CALL
+  MESSAGE
+  MEETING
+  TRIAL
+  NOTE
+  STATUS_CHANGED
+  ASSIGNED
+  FOLLOW_UP
+}
+
+/// Where a lead came from (Instagram, Referral, Walk-in...). Organization-scoped.
+model LeadSource {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  name           String   @db.VarChar(120)
+  /// Stable machine name, unique per organization (e.g. INSTAGRAM).
+  code           String   @db.VarChar(32)
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  leads        Lead[]
+
+  @@unique([organizationId, code])
+  @@unique([id, organizationId])
+  @@index([organizationId, isActive])
+  @@map("lead_sources")
+}
+
+/// A configurable funnel. One organization may run several; one is the default.
+model LeadPipeline {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  name           String   @db.VarChar(120)
+  isActive       Boolean  @default(true) @map("is_active")
+  isDefault      Boolean  @default(false) @map("is_default")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  stages       LeadStage[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, isActive])
+  @@map("lead_pipelines")
+}
+
+/// An ordered column of a pipeline. `organizationId` is denormalized so leads
+/// can reference (stageId, organizationId) and stay inside the organization.
+model LeadStage {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  pipelineId     String   @map("pipeline_id") @db.Uuid
+  name           String   @db.VarChar(120)
+  code           String   @db.VarChar(32)
+  order          Int      @default(0)
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  pipeline     LeadPipeline @relation(fields: [pipelineId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  leads        Lead[]
+
+  @@unique([pipelineId, code])
+  @@unique([id, organizationId])
+  @@index([pipelineId, order])
+  @@map("lead_stages")
+}
+
+/// The pre-enrollment funnel record. Soft-deleted (`deletedAt`), never removed.
+model Lead {
+  id                 String       @id @default(uuid(7)) @db.Uuid
+  organizationId     String       @map("organization_id") @db.Uuid
+  branchId           String       @map("branch_id") @db.Uuid
+  name               String       @db.VarChar(160)
+  phone              String       @db.VarChar(20)
+  /// Digits-only form used for duplicate detection (see normalizePhone).
+  phoneNormalized    String       @map("phone_normalized") @db.VarChar(20)
+  secondaryPhone     String?      @map("secondary_phone") @db.VarChar(20)
+  sourceId           String?      @map("source_id") @db.Uuid
+  /// Optional position on a pipeline board (parallel to `status`).
+  stageId            String?      @map("stage_id") @db.Uuid
+  assignedToId       String?      @map("assigned_to_id") @db.Uuid
+  status             LeadStatus   @default(NEW)
+  priority           LeadPriority @default(MEDIUM)
+  notes              String?      @db.Text
+  nextFollowUpAt     DateTime?    @map("next_follow_up_at") @db.Timestamptz(3)
+  convertedAt        DateTime?    @map("converted_at") @db.Timestamptz(3)
+  /// Set by conversion — soft pointers to the created/linked records.
+  convertedFamilyId  String?      @map("converted_family_id") @db.Uuid
+  convertedStudentId String?      @map("converted_student_id") @db.Uuid
+  lostReason         String?      @map("lost_reason") @db.VarChar(500)
+  createdAt          DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt          DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
+  deletedAt          DateTime?    @map("deleted_at") @db.Timestamptz(3)
+
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch         @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  source       LeadSource?    @relation(fields: [sourceId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  stage        LeadStage?     @relation(fields: [stageId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  assignedTo   User?          @relation("LeadAssignee", fields: [assignedToId], references: [id], onDelete: SetNull)
+  activities   LeadActivity[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, branchId, status])
+  @@index([organizationId, status])
+  @@index([organizationId, assignedToId, status])
+  @@index([organizationId, phoneNormalized])
+  @@index([organizationId, sourceId])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, nextFollowUpAt])
+  @@index([stageId])
+  @@map("leads")
+}
+
+/// Append-only timeline of everything that happened to a lead.
+model LeadActivity {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  branchId       String           @map("branch_id") @db.Uuid
+  leadId         String           @map("lead_id") @db.Uuid
+  /// User who performed it (null for system-generated entries).
+  userId         String?          @map("user_id") @db.Uuid
+  type           LeadActivityType
+  note           String?          @db.VarChar(2000)
+  /// Small JSON detail, e.g. { from, to } for STATUS_CHANGED.
+  metadata       Json?
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch       @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  lead         Lead         @relation(fields: [leadId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([leadId, createdAt])
+  @@index([organizationId, branchId, type])
+  @@map("lead_activities")
+}
+
+// ─── HR & Task Management (Phase 6) ────────────────────────────────────────────
+//
+// Position ─┐
+// Department ┼─ Employee ── EmployeeBranch ── Branch
+// User ──────┘      │
+//                   └─ assignee of Task ── TaskActivity (append-only history)
+//                                      └─ TaskComment
+//
+// An Employee is a staff record, not a login: `userId` is optional and links to
+// the User whose access is still governed by OrganizationMembership/BranchMembership.
+// Positions and departments are per-organization data, never hardcoded.
+
+enum EmployeeStatus {
+  ACTIVE
+  ON_LEAVE
+  INACTIVE
+  TERMINATED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  BLOCKED
+  COMPLETED
+  CANCELLED
+}
+
+/// CRM resources a task may point at (validated in the service; no FK).
+enum TaskRelatedType {
+  LEAD
+  STUDENT
+  FAMILY
+  GROUP
+  EMPLOYEE
+}
+
+enum TaskActivityType {
+  CREATED
+  UPDATED
+  ASSIGNED
+  STATUS_CHANGED
+  PRIORITY_CHANGED
+  DEADLINE_CHANGED
+  COMMENTED
+  COMPLETED
+  CANCELLED
+  DELETED
+}
+
+model Position {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  name           String   @db.VarChar(120)
+  /// Unique per organization, upper-case. @example "SALES_MANAGER"
+  code           String   @db.VarChar(50)
+  description    String?  @db.VarChar(500)
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  employees    Employee[]
+
+  @@unique([organizationId, code])
+  @@unique([id, organizationId])
+  @@index([organizationId, isActive])
+  @@map("positions")
+}
+
+model Department {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  name           String   @db.VarChar(120)
+  code           String   @db.VarChar(50)
+  description    String?  @db.VarChar(500)
+  isActive       Boolean  @default(true) @map("is_active")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  employees    Employee[]
+
+  @@unique([organizationId, code])
+  @@unique([id, organizationId])
+  @@index([organizationId, isActive])
+  @@map("departments")
+}
+
+model Employee {
+  id              String         @id @default(uuid(7)) @db.Uuid
+  organizationId  String         @map("organization_id") @db.Uuid
+  /// Mirrors the EmployeeBranch row with isPrimary = true (kept in sync in one transaction).
+  primaryBranchId String         @map("primary_branch_id") @db.Uuid
+  /// Optional CRM login. One employee per user per organization.
+  userId          String?        @map("user_id") @db.Uuid
+  firstName       String         @map("first_name") @db.VarChar(100)
+  lastName        String         @map("last_name") @db.VarChar(100)
+  middleName      String?        @map("middle_name") @db.VarChar(100)
+  phone           String         @db.VarChar(20)
+  email           String?        @db.VarChar(254)
+  birthDate       DateTime?      @map("birth_date") @db.Date
+  hireDate        DateTime       @map("hire_date") @db.Date
+  terminationDate DateTime?      @map("termination_date") @db.Date
+  positionId      String?        @map("position_id") @db.Uuid
+  departmentId    String?        @map("department_id") @db.Uuid
+  status          EmployeeStatus @default(ACTIVE)
+  notes           String?        @db.VarChar(2000)
+  createdAt       DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  primaryBranch  Branch              @relation(fields: [primaryBranchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  user           User?               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  position       Position?           @relation(fields: [positionId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  department     Department?         @relation(fields: [departmentId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  branches       EmployeeBranch[]
+  assignedTasks  Task[]              @relation("TaskAssignee")
+  checklists     ChecklistTemplate[]
+  checklistItems ChecklistItem[]
+
+  @@unique([organizationId, userId])
+  @@unique([id, organizationId])
+  @@index([organizationId, status])
+  @@index([organizationId, primaryBranchId])
+  @@index([organizationId, positionId])
+  @@index([organizationId, departmentId])
+  @@index([organizationId, phone])
+  @@map("employees")
+}
+
+/// Branches an employee works in. Exactly one row per employee is primary
+/// (partial unique index in the migration).
+model EmployeeBranch {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  employeeId     String   @map("employee_id") @db.Uuid
+  branchId       String   @map("branch_id") @db.Uuid
+  isPrimary      Boolean  @default(false) @map("is_primary")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  employee     Employee     @relation(fields: [employeeId, organizationId], references: [id, organizationId], onDelete: Cascade)
+  branch       Branch       @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@unique([employeeId, branchId])
+  @@index([organizationId, branchId])
+  @@map("employee_branches")
+}
+
+model Task {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  branchId       String           @map("branch_id") @db.Uuid
+  title          String           @db.VarChar(200)
+  description    String?          @db.VarChar(5000)
+  createdById    String           @map("created_by_id") @db.Uuid
+  /// Single assignee today; multi-assignee would add a TaskAssignee join table.
+  assignedToId   String?          @map("assigned_to_id") @db.Uuid
+  priority       TaskPriority     @default(MEDIUM)
+  status         TaskStatus       @default(TODO)
+  dueDate        DateTime?        @map("due_date") @db.Timestamptz(3)
+  completedAt    DateTime?        @map("completed_at") @db.Timestamptz(3)
+  relatedType    TaskRelatedType? @map("related_type")
+  relatedId      String?          @map("related_id") @db.Uuid
+  /// Tasks given to several (or all) employees at once share a batch: one copy each.
+  batchId        String?          @map("batch_id") @db.Uuid
+  deletedAt      DateTime?        @map("deleted_at") @db.Timestamptz(3)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization   @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch         @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  createdBy    User           @relation("TaskCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  assignedTo   Employee?      @relation("TaskAssignee", fields: [assignedToId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  activities   TaskActivity[]
+  comments     TaskComment[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, branchId, status])
+  @@index([organizationId, assignedToId, status])
+  @@index([organizationId, status, dueDate])
+  @@index([organizationId, priority])
+  @@index([organizationId, createdAt])
+  @@index([organizationId, relatedType, relatedId])
+  @@map("tasks")
+}
+
+/// Append-only task history. Never updated or deleted.
+model TaskActivity {
+  id             String           @id @default(uuid(7)) @db.Uuid
+  organizationId String           @map("organization_id") @db.Uuid
+  taskId         String           @map("task_id") @db.Uuid
+  userId         String           @map("user_id") @db.Uuid
+  type           TaskActivityType
+  oldValue       String?          @map("old_value") @db.VarChar(500)
+  newValue       String?          @map("new_value") @db.VarChar(500)
+  note           String?          @db.VarChar(2000)
+  createdAt      DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  task         Task         @relation(fields: [taskId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([taskId, createdAt])
+  @@index([userId])
+  @@map("task_activities")
+}
+
+model TaskComment {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  taskId         String   @map("task_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  content        String   @db.VarChar(5000)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  task         Task         @relation(fields: [taskId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Restrict)
+
+  @@index([taskId, createdAt])
+  @@index([userId])
+  @@map("task_comments")
+}
+
+// ─── Notifications & Communication (Phase 7) ───────────────────────────────────
+//
+// Domain event ─→ NotificationsService ─→ Notification (one per recipient, in-app record)
+//                                              └─ NotificationDelivery (one per channel) ─→ queue ─→ provider
+//
+// Providers (Telegram, email, SMS, push) are plug-ins behind an interface and
+// never referenced by business modules. `eventKey` makes every notification
+// idempotent per recipient. Policies and templates are per-organization data
+// layered over code defaults (notification-types.catalog.ts).
+
+enum NotificationType {
+  TASK_ASSIGNED
+  TASK_DUE
+  TASK_OVERDUE
+  PAYMENT_RECEIVED
+  PAYMENT_DUE
+  PAYMENT_OVERDUE
+  ATTENDANCE_ABSENT
+  ATTENDANCE_LATE
+  LEAD_ASSIGNED
+  LEAD_FOLLOW_UP
+  SYSTEM
+  /// Leadership announcement (a communication, not a task).
+  ANNOUNCEMENT
+  /// Congratulation to an employee (birthday, anniversary, achievement, thanks).
+  CONGRATULATION
+}
+
+enum NotificationPriority {
+  LOW
+  NORMAL
+  HIGH
+  URGENT
+}
+
+enum NotificationChannel {
+  IN_APP
+  TELEGRAM
+  EMAIL
+  SMS
+  PUSH
+}
+
+enum NotificationDeliveryStatus {
+  PENDING
+  SENT
+  DELIVERED
+  FAILED
+  CANCELLED
+}
+
+model Notification {
+  id              String               @id @default(uuid(7)) @db.Uuid
+  organizationId  String               @map("organization_id") @db.Uuid
+  /// Null for organization-wide notifications.
+  branchId        String?              @map("branch_id") @db.Uuid
+  type            NotificationType
+  title           String               @db.VarChar(200)
+  message         String               @db.VarChar(2000)
+  priority        NotificationPriority @default(NORMAL)
+  recipientUserId String               @map("recipient_user_id") @db.Uuid
+  /// Resource the notification is about, e.g. ("Task", id). Ids only — never access by itself.
+  relatedType     String?              @map("related_type") @db.VarChar(32)
+  relatedId       String?              @map("related_id") @db.Uuid
+  /// Idempotency key of the source event, e.g. "PAYMENT_RECEIVED:<paymentId>".
+  eventKey        String               @map("event_key") @db.VarChar(200)
+  /// Allow-listed template variables, re-used to render channel templates at send time.
+  data            Json                 @default("{}")
+  /// false when the recipient turned the in-app channel off (external channels only).
+  inApp           Boolean              @default(true) @map("in_app")
+  isRead          Boolean              @default(false) @map("is_read")
+  readAt          DateTime?            @map("read_at") @db.Timestamptz(3)
+  deletedAt       DateTime?            @map("deleted_at") @db.Timestamptz(3)
+  createdAt       DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  organization Organization           @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch?                @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  recipient    User                   @relation(fields: [recipientUserId], references: [id], onDelete: Cascade)
+  deliveries   NotificationDelivery[]
+
+  @@unique([organizationId, recipientUserId, eventKey])
+  @@unique([id, organizationId])
+  @@index([organizationId, recipientUserId, isRead, createdAt])
+  @@index([organizationId, recipientUserId, createdAt])
+  @@index([organizationId, branchId])
+  @@index([organizationId, type])
+  @@index([createdAt])
+  @@map("notifications")
+}
+
+/// One row per (notification, channel): the delivery history.
+model NotificationDelivery {
+  id                String                     @id @default(uuid(7)) @db.Uuid
+  organizationId    String                     @map("organization_id") @db.Uuid
+  notificationId    String                     @map("notification_id") @db.Uuid
+  channel           NotificationChannel
+  status            NotificationDeliveryStatus @default(PENDING)
+  /// Provider that handled the last attempt, e.g. "telegram-bot", "mock-email".
+  provider          String?                    @db.VarChar(50)
+  providerMessageId String?                    @map("provider_message_id") @db.VarChar(200)
+  sentAt            DateTime?                  @map("sent_at") @db.Timestamptz(3)
+  deliveredAt       DateTime?                  @map("delivered_at") @db.Timestamptz(3)
+  failedAt          DateTime?                  @map("failed_at") @db.Timestamptz(3)
+  errorMessage      String?                    @map("error_message") @db.VarChar(1000)
+  attempts          Int                        @default(0)
+  createdAt         DateTime                   @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt         DateTime                   @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  notification Notification @relation(fields: [notificationId, organizationId], references: [id, organizationId], onDelete: Cascade)
+
+  @@unique([notificationId, channel])
+  @@index([organizationId, channel, status])
+  @@index([organizationId, status, createdAt])
+  @@index([createdAt])
+  @@map("notification_deliveries")
+}
+
+/// A user's channel choices for one notification type (absent row → policy defaults).
+model NotificationPreference {
+  id              String           @id @default(uuid(7)) @db.Uuid
+  userId          String           @map("user_id") @db.Uuid
+  organizationId  String           @map("organization_id") @db.Uuid
+  type            NotificationType
+  inAppEnabled    Boolean          @map("in_app_enabled")
+  telegramEnabled Boolean          @map("telegram_enabled")
+  emailEnabled    Boolean          @map("email_enabled")
+  smsEnabled      Boolean          @map("sms_enabled")
+  pushEnabled     Boolean          @map("push_enabled")
+  createdAt       DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, organizationId, type])
+  @@index([organizationId])
+  @@map("notification_preferences")
+}
+
+/// Organization-specific text for a (type, channel); absent → code default.
+model NotificationTemplate {
+  id              String              @id @default(uuid(7)) @db.Uuid
+  organizationId  String              @map("organization_id") @db.Uuid
+  type            NotificationType
+  channel         NotificationChannel
+  titleTemplate   String              @map("title_template") @db.VarChar(200)
+  messageTemplate String              @map("message_template") @db.VarChar(2000)
+  isActive        Boolean             @default(true) @map("is_active")
+  createdAt       DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt       DateTime            @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, type, channel])
+  @@index([organizationId, type])
+  @@map("notification_templates")
+}
+
+/// Type-level policy of an organization (absent row → code default): whether the
+/// type is on, who receives it besides the event subject, default and locked channels.
+model NotificationPolicy {
+  id                  String                @id @default(uuid(7)) @db.Uuid
+  organizationId      String                @map("organization_id") @db.Uuid
+  type                NotificationType
+  isEnabled           Boolean               @map("is_enabled")
+  /// Members holding this permission (with branch access) also receive the type.
+  recipientPermission String?               @map("recipient_permission") @db.VarChar(100)
+  defaultChannels     NotificationChannel[] @map("default_channels")
+  /// Channels users cannot switch off in their preferences.
+  lockedChannels      NotificationChannel[] @map("locked_channels")
+  createdAt           DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime              @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, type])
+  @@map("notification_policies")
+}
+
+/// A user's linked Telegram chat (one per user; a Telegram user links to one CRM user).
+model UserTelegramAccount {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  userId         String   @unique @map("user_id") @db.Uuid
+  /// Telegram ids exceed 32 bits; stored as text to stay JSON-safe.
+  telegramUserId String   @unique @map("telegram_user_id") @db.VarChar(32)
+  username       String?  @db.VarChar(64)
+  chatId         String   @map("chat_id") @db.VarChar(32)
+  isVerified     Boolean  @default(false) @map("is_verified")
+  linkedAt       DateTime @default(now()) @map("linked_at") @db.Timestamptz(3)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("user_telegram_accounts")
+}
+
+/// Short-lived one-time code the user sends to the bot (`/start <code>`). Only its hash is stored.
+model TelegramLinkToken {
+  id        String    @id @default(uuid(7)) @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  codeHash  String    @unique @map("code_hash") @db.VarChar(64)
+  expiresAt DateTime  @map("expires_at") @db.Timestamptz(3)
+  usedAt    DateTime? @map("used_at") @db.Timestamptz(3)
+  createdAt DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("telegram_link_tokens")
+}
+
+// ─── Audit (Phase 8) ───────────────────────────────────────────────────────────
+//
+// Append-only security trail. No foreign keys on purpose: audit rows must
+// outlive (and never block) the records they describe. A database trigger
+// rejects UPDATE and DELETE, so not even a bug or a direct SQL session through
+// the app role can rewrite history. Sensitive fields are stripped before insert.
+
+model AuditLog {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  /// Null for account-level events (login, logout, register).
+  organizationId String?  @map("organization_id") @db.Uuid
+  branchId       String?  @map("branch_id") @db.Uuid
+  /// Actor; null for system actions (scheduled jobs).
+  userId         String?  @map("user_id") @db.Uuid
+  /// e.g. PAYMENT_CREATED, ENROLLMENT_TRANSFERRED, LOGIN, CREATE, UPDATE, DELETE.
+  action         String   @db.VarChar(64)
+  entityType     String?  @map("entity_type") @db.VarChar(64)
+  entityId       String?  @map("entity_id") @db.VarChar(64)
+  oldData        Json?    @map("old_data")
+  newData        Json?    @map("new_data")
+  ipAddress      String?  @map("ip_address") @db.VarChar(64)
+  userAgent      String?  @map("user_agent") @db.VarChar(500)
+  /// Links the row to the request's logs and error responses (X-Request-ID).
+  requestId      String?  @map("request_id") @db.VarChar(128)
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+
+  @@index([organizationId, createdAt])
+  @@index([organizationId, entityType, entityId])
+  @@index([organizationId, userId, createdAt])
+  @@index([organizationId, action, createdAt])
+  @@index([organizationId, branchId, createdAt])
+  @@index([userId, createdAt])
+  @@map("audit_logs")
+}
+
+// ─── Daily checklists ─────────────────────────────────────────────────────────
+//
+// A template ("09:00 — Kassani tekshirish", assigned to an employee) produces
+// one item per working day; the item carries the day's status and comment.
+
+model ChecklistTemplate {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  branchId       String   @map("branch_id") @db.Uuid
+  assigneeId     String   @map("assignee_id") @db.Uuid
+  title          String   @db.VarChar(200)
+  /// Instructions shown under the title.
+  note           String?  @db.VarChar(1000)
+  /// "HH:MM" in the center's timezone — the daily deadline.
+  dueTime        String   @map("due_time") @db.VarChar(5)
+  /// ISO weekdays it runs on (1 = Monday … 7 = Sunday).
+  weekdays       Int[]    @default([1, 2, 3, 4, 5, 6, 7])
+  isActive       Boolean  @default(true) @map("is_active")
+  createdById    String   @map("created_by_id") @db.Uuid
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization    @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  branch       Branch          @relation(fields: [branchId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  assignee     Employee        @relation(fields: [assigneeId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  createdBy    User            @relation("ChecklistCreatedBy", fields: [createdById], references: [id], onDelete: Restrict)
+  items        ChecklistItem[]
+
+  @@unique([id, organizationId])
+  @@index([organizationId, isActive])
+  @@map("checklist_templates")
+}
+
+model ChecklistItem {
+  id             String    @id @default(uuid(7)) @db.Uuid
+  organizationId String    @map("organization_id") @db.Uuid
+  branchId       String    @map("branch_id") @db.Uuid
+  templateId     String    @map("template_id") @db.Uuid
+  assigneeId     String    @map("assignee_id") @db.Uuid
+  /// The working day (center calendar).
+  date           DateTime  @db.Date
+  /// That day's deadline as an instant.
+  dueAt          DateTime  @map("due_at") @db.Timestamptz(3)
+  completedAt    DateTime? @map("completed_at") @db.Timestamptz(3)
+  completedById  String?   @map("completed_by_id") @db.Uuid
+  /// Written inline by the assignee; autosaved.
+  comment        String?   @db.VarChar(2000)
+  commentAt      DateTime? @map("comment_at") @db.Timestamptz(3)
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  template     ChecklistTemplate @relation(fields: [templateId, organizationId], references: [id, organizationId], onDelete: Restrict)
+  assignee     Employee          @relation(fields: [assigneeId, organizationId], references: [id, organizationId], onDelete: Restrict)
+
+  @@unique([templateId, date])
+  @@index([organizationId, date])
+  @@index([organizationId, assigneeId, date])
+  @@map("checklist_items")
+}
+
+// ─── Personal dashboard ──────────────────────────────────────────────────────
+
+/**
+ * A member's dashboard in one center: which widgets, in what order, chart types, saved filters.
+ */
+model DashboardLayout {
+  id             String   @id @default(uuid(7)) @db.Uuid
+  organizationId String   @map("organization_id") @db.Uuid
+  userId         String   @map("user_id") @db.Uuid
+  widgets        Json     @default("[]")
+  filters        Json     @default("{}")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt      DateTime @updatedAt @map("updated_at") @db.Timestamptz(3)
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user         User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([organizationId, userId])
+  @@map("dashboard_layouts")
+}

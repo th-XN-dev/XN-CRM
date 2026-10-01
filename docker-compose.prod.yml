@@ -1,0 +1,88 @@
+# Production stack: web (SPA + /api proxy) + API + PostgreSQL + Redis (+ a one-off migration job).
+#
+#   cp .env.production.example .env.production   # fill in real secrets
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+#
+# Only the web container needs to be public (put a TLS proxy such as Caddy/Traefik in front for HTTPS);
+# the API is reached through it at /api. The database and Redis stay on the private network.
+name: xn-crm-prod
+
+x-api-image: &api-image
+  build: .
+  image: xn-crm-api:${APP_VERSION:-1.0.0}
+  env_file: .env.production
+  environment:
+    NODE_ENV: production
+    DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+    REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379
+
+services:
+  # Applies pending migrations and syncs the RBAC catalog (no test data), then exits.
+  migrate:
+    <<: *api-image
+    command: ['sh', '-c', 'npx prisma migrate deploy && node dist/database/seed.js']
+    restart: 'no'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *api-image
+    restart: unless-stopped
+    init: true # tini as PID 1: forwards SIGTERM to Node for a graceful shutdown
+    stop_grace_period: 30s
+    ports:
+      - '${API_PORT:-3000}:3000'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: ./frontend
+      args:
+        BUILD_MODE: ${WEB_BUILD_MODE:-production}
+    image: xn-crm-web:${APP_VERSION:-1.0.0}
+    restart: unless-stopped
+    ports:
+      - '${WEB_PORT:-8080}:8080'
+    depends_on:
+      - api
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command:
+      ['redis-server', '--appendonly', 'yes', '--requirepass', '${REDIS_PASSWORD:?set REDIS_PASSWORD}']
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD-SHELL', 'redis-cli -a "$${REDIS_PASSWORD}" --no-auth-warning ping | grep PONG']
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+
+volumes:
+  postgres_data:
+  redis_data:

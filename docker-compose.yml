@@ -1,0 +1,42 @@
+# Development infrastructure only: PostgreSQL + Redis for `npm run start:dev`
+# and the e2e tests. The production stack is docker-compose.prod.yml.
+name: xn-crm
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-xn_crm}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-xn_crm_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-xn_crm}
+    ports:
+      - '${POSTGRES_PORT:-5432}:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      # Creates the xn_crm_test database on first start (used by e2e tests).
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Notification queue (BullMQ). The API falls back to an in-process queue when REDIS_URL is unset.
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ['redis-server', '--appendonly', 'yes']
+    ports:
+      - '${REDIS_PORT:-6379}:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
+  redis_data:

@@ -1,0 +1,21 @@
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+!.env.test.example
+.DS_Store
+*.log
+!.env.production.example
+# Frontend mode files hold only public VITE_* values (they end up in the bundle anyway).
+!frontend/.env.development
+!frontend/.env.staging
+!frontend/.env.production
+frontend/.env*.local
+
+# Database backups never go to the repository
+backups/
+*.dump
+*.sql.gz

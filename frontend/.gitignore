@@ -1,0 +1,16 @@
+node_modules
+dist
+coverage
+playwright-report
+test-results
+*.local
+.env
+.env.*
+# Public mode files (VITE_* values only) are committed; local overrides are not.
+!.env.development
+!.env.staging
+!.env.production
+.env*.local
+.DS_Store
+e2e/.fixtures.json
+e2e/screenshots

@@ -1,0 +1,214 @@
+@import 'tailwindcss';
+
+/* Dark mode is a class on <html> (Light / Dark / System handled in useTheme). */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/*
+ * Design tokens. Components only use these semantic names (bg-surface,
+ * text-fg, bg-primary, border-border…), never raw colors. Light and dark are
+ * two separate, hand-tuned token sets — not an inversion.
+ *
+ * Brand tokens (--brand-50…950, --brand-primary*) are written at runtime from
+ * the organization's primaryColor (lib/color.ts → composables/useBrand.ts).
+ */
+:root {
+  color-scheme: light;
+
+  --bg: oklch(0.975 0.004 270);
+  --bg-accent: color-mix(in oklab, var(--brand-accent-200, var(--brand-200)) 45%, transparent);
+  --surface: oklch(1 0 0);
+  --surface-muted: oklch(0.965 0.005 270);
+  --surface-hover: oklch(0.95 0.007 270);
+  --border: oklch(0.91 0.008 270);
+  --border-strong: oklch(0.84 0.01 270);
+  --fg: oklch(0.21 0.02 270);
+  --fg-muted: oklch(0.45 0.02 270);
+  --fg-subtle: oklch(0.6 0.015 270);
+
+  --primary: var(--brand-primary);
+  --primary-fg: var(--brand-primary-fg);
+  --primary-hover: color-mix(in oklab, var(--brand-primary) 88%, black);
+  --primary-soft: var(--brand-50);
+  --primary-soft-fg: var(--brand-700);
+  --primary-text: var(--brand-700);
+  --ring: color-mix(in oklab, var(--brand-500) 55%, transparent);
+
+  --success: oklch(0.55 0.14 155);
+  --success-soft: oklch(0.96 0.04 155);
+  --warning: oklch(0.6 0.14 70);
+  --warning-soft: oklch(0.97 0.05 85);
+  --danger: oklch(0.55 0.2 25);
+  --danger-soft: oklch(0.96 0.03 25);
+  --info: oklch(0.55 0.13 240);
+  --info-soft: oklch(0.96 0.03 240);
+
+  --glass-bg: oklch(1 0 0 / 0.72);
+  --glass-strong-bg: oklch(0.995 0.002 270 / 0.94);
+  --glass-border: oklch(1 0 0 / 0.6);
+  --glass-shadow: 0 8px 32px oklch(0.3 0.03 270 / 0.08), 0 1px 2px oklch(0.3 0.03 270 / 0.06);
+  --overlay: oklch(0.2 0.02 270 / 0.4);
+  --shadow-card: 0 1px 2px oklch(0.3 0.02 270 / 0.06), 0 1px 3px oklch(0.3 0.02 270 / 0.04);
+}
+
+.dark {
+  color-scheme: dark;
+
+  --bg: oklch(0.16 0.012 270);
+  --bg-accent: color-mix(in oklab, var(--brand-accent-900, var(--brand-900)) 55%, transparent);
+  --surface: oklch(0.205 0.014 270);
+  --surface-muted: oklch(0.235 0.014 270);
+  --surface-hover: oklch(0.265 0.016 270);
+  --border: oklch(0.3 0.014 270);
+  --border-strong: oklch(0.38 0.016 270);
+  --fg: oklch(0.95 0.005 270);
+  --fg-muted: oklch(0.74 0.012 270);
+  --fg-subtle: oklch(0.6 0.012 270);
+
+  --primary: var(--brand-primary-dark);
+  --primary-fg: var(--brand-primary-dark-fg);
+  --primary-hover: color-mix(in oklab, var(--brand-primary-dark) 85%, white);
+  --primary-soft: color-mix(in oklab, var(--brand-500) 18%, transparent);
+  --primary-soft-fg: var(--brand-200);
+  --primary-text: var(--brand-300);
+  --ring: color-mix(in oklab, var(--brand-400) 60%, transparent);
+
+  --success: oklch(0.72 0.15 155);
+  --success-soft: oklch(0.3 0.06 155 / 0.6);
+  --warning: oklch(0.8 0.14 80);
+  --warning-soft: oklch(0.32 0.06 80 / 0.6);
+  --danger: oklch(0.7 0.18 25);
+  --danger-soft: oklch(0.32 0.08 25 / 0.6);
+  --info: oklch(0.72 0.12 240);
+  --info-soft: oklch(0.3 0.06 240 / 0.6);
+
+  --glass-bg: oklch(0.22 0.015 270 / 0.66);
+  --glass-strong-bg: oklch(0.21 0.014 270 / 0.95);
+  --glass-border: oklch(1 0 0 / 0.08);
+  --glass-shadow: 0 8px 32px oklch(0 0 0 / 0.35), 0 1px 2px oklch(0 0 0 / 0.3);
+  --overlay: oklch(0 0 0 / 0.55);
+  --shadow-card: 0 1px 2px oklch(0 0 0 / 0.3);
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-muted: var(--surface-muted);
+  --color-surface-hover: var(--surface-hover);
+  --color-border: var(--border);
+  --color-border-strong: var(--border-strong);
+  --color-fg: var(--fg);
+  --color-fg-muted: var(--fg-muted);
+  --color-fg-subtle: var(--fg-subtle);
+
+  --color-primary: var(--primary);
+  --color-primary-fg: var(--primary-fg);
+  --color-primary-hover: var(--primary-hover);
+  --color-primary-soft: var(--primary-soft);
+  --color-primary-soft-fg: var(--primary-soft-fg);
+  --color-primary-text: var(--primary-text);
+  --color-ring: var(--ring);
+
+  --color-brand-50: var(--brand-50);
+  --color-brand-100: var(--brand-100);
+  --color-brand-200: var(--brand-200);
+  --color-brand-300: var(--brand-300);
+  --color-brand-400: var(--brand-400);
+  --color-brand-500: var(--brand-500);
+  --color-brand-600: var(--brand-600);
+  --color-brand-700: var(--brand-700);
+  --color-brand-800: var(--brand-800);
+  --color-brand-900: var(--brand-900);
+  --color-brand-950: var(--brand-950);
+
+  --color-success: var(--success);
+  --color-success-soft: var(--success-soft);
+  --color-warning: var(--warning);
+  --color-warning-soft: var(--warning-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-info: var(--info);
+  --color-info-soft: var(--info-soft);
+  --color-overlay: var(--overlay);
+
+  --shadow-card: var(--shadow-card);
+  --shadow-glass: var(--glass-shadow);
+
+  --font-sans:
+    'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue',
+    Arial, sans-serif;
+}
+
+/*
+ * Glass is reserved for floating chrome (sidebar, header, modals, menus,
+ * floating panels) — content stays on solid surfaces for readability.
+ */
+@utility glass {
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(18px) saturate(160%);
+  -webkit-backdrop-filter: blur(18px) saturate(160%);
+
+  @supports not (backdrop-filter: blur(1px)) {
+    background: var(--surface);
+  }
+}
+
+/* Overlays (menus, dialogs, drawers, toasts) sit on top of content: nearly opaque, so text never mixes. */
+@utility glass-strong {
+  background: var(--glass-strong-bg);
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--glass-shadow);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+}
+
+@utility focus-ring {
+  outline: 2px solid transparent;
+  &:focus-visible {
+    box-shadow:
+      0 0 0 2px var(--bg),
+      0 0 0 4px var(--ring);
+  }
+}
+
+@layer base {
+  html {
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-bg font-sans text-fg antialiased;
+    /* Soft brand glow behind the glass chrome; content areas stay solid. */
+    background-image:
+      radial-gradient(60rem 40rem at 110% -10%, var(--bg-accent), transparent 60%),
+      radial-gradient(50rem 35rem at -10% 110%, var(--bg-accent), transparent 60%);
+    background-attachment: fixed;
+    min-height: 100dvh;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 2px;
+  }
+
+  ::selection {
+    background: color-mix(in oklab, var(--brand-400) 35%, transparent);
+  }
+
+  dialog::backdrop {
+    background: var(--overlay);
+    backdrop-filter: blur(2px);
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+      scroll-behavior: auto !important;
+    }
+  }
+}
